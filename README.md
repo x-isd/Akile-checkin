@@ -95,7 +95,7 @@ password = your_password            # Akile 账号密码
 ```
 登录成功
 当前AK币: 100
-找到签到按钮，正在点击...
+今天暂无签到流水，正在调用 Akile 官方签到接口...
 签到成功, 获得10个AK币, 当前有110个AK币
 ```
 
@@ -103,8 +103,12 @@ password = your_password            # Akile 账号密码
 ```
 登录成功
 当前AK币: 100
-今日已签到, 现在有100AK币
+今日已签到，未重复执行签到，现在有100AK币
 ```
+
+脚本登录后会先读取 `/api/v1/akcoin/log` 的当天流水。只有当天没有签到记录时，才调用前端实际使用的 `GET /api/v1/user/Checkin` 接口；调用成功后还会再次检查当天流水和余额是否增加。页面上的「今日已签到」按钮只由 `last_checkin_time` 控制，不能单独作为成功凭证。
+
+如果 GitHub Actions 日志出现「今日已签到，未重复执行签到」，表示当天流水中已经存在签到记录，脚本会跳过重复调用并以成功状态结束；这不是登录失败。只有出现「签到失败」时，才需要检查 Actions 失败运行中生成的 `akile-checkin-diagnostics` 截图 artifact。
 
 强制改密拦截（需手动处理）：
 ```
@@ -132,6 +136,7 @@ Akile-checkin/
 selenium
 undetected-chromedriver
 requests
+setuptools
 ```
 
 ## ⚠️ 免责声明
