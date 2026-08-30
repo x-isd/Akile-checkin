@@ -1,4 +1,5 @@
 import configparser
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import shutil
@@ -6,7 +7,11 @@ import subprocess
 import sys
 import time
 
+# Python 3.12+ 移除了 distutils；setuptools 提供兼容层，供旧版
+# undetected-chromedriver 导入其 LooseVersion。requirements.txt 会安装它。
+import setuptools  # noqa: F401
 import undetected_chromedriver as uc
+from selenium import webdriver
 from notice import Notice
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
@@ -17,6 +22,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 class AkileCheckin:
     def __init__(self):
         self.browser = None
+        print("Akile签到脚本版本: 2026-08-30-api-checkin-fix-2")
 
         # 优先读取环境变量（便于在 GitHub Actions 中直接运行）
         self.email = os.getenv("AKILE_EMAIL", "").strip()
@@ -53,8 +59,48 @@ class AkileCheckin:
 
         if chrome_major:
             self.browser = uc.Chrome(options=options, version_main=chrome_major)
-        else:
-            self.browser = uc.Chrome(options=options)
+            return
+
+        # Windows 本地可能只有 Chromium 内核的 Edge；使用 Selenium EdgeDriver
+        # 作为 fallback，避免把 Edge 二进制交给 uc.Chrome 造成驱动协议错配。
+        edge_path = self._get_edge_path()
+        if edge_path:
+            edge_options = webdriver.EdgeOptions()
+            edge_options.add_argument("--lang=zh-CN")
+            edge_options.add_experimental_option(
+                "prefs", {"intl.accept_languages": "zh-CN,zh"}
+            )
+            edge_options.add_argument("--headless=new")
+            edge_options.add_argument("--disable-gpu")
+            edge_options.add_argument("--no-sandbox")
+            edge_options.add_argument("--disable-dev-shm-usage")
+            edge_options.add_argument("--window-size=1920,1080")
+            edge_options.add_argument(
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+            )
+            edge_options.binary_location = edge_path
+            self.browser = webdriver.Edge(options=edge_options)
+            print(f"Using Edge binary: {edge_path}")
+            return
+
+        self.browser = uc.Chrome(options=options)
+
+    @staticmethod
+    def _get_edge_path():
+        candidates = [
+            shutil.which("msedge"),
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ]
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(
+                os.path.join(
+                    local_app_data, "Microsoft", "Edge", "Application", "msedge.exe"
+                )
+            )
+        return next((path for path in candidates if path and os.path.exists(path)), None)
 
     @staticmethod
     def _get_chrome_info():
@@ -305,42 +351,120 @@ class AkileCheckin:
         except Exception:
             return -1
 
-    def _find_visible_checkin_state(self):
-        for label, state in (("已签到", "already"), ("今日已签到", "already")):
-            try:
-                buttons = self.browser.find_elements(
-                    By.XPATH, f'//button[contains(normalize-space(.), "{label}")]'
-                )
-                if any(button.is_displayed() for button in buttons):
-                    return state
-            except Exception:
-                continue
+    def _api_request(self, path, method="GET", body=None):
+        """通过当前 Edge 登录会话调用 Akile 前端使用的 API。"""
+        script = """
+        const path = arguments[0];
+        const method = arguments[1];
+        const payload = arguments[2];
+        const done = arguments[arguments.length - 1];
+        (async () => {
+            const token = localStorage.getItem("akile-token") || "";
+            if (!token) {
+                done({http_status: 0, error: "登录令牌不存在"});
+                return;
+            }
+            const apiBase = window.location.hostname.includes("akilecloud.com")
+                ? "https://api.akilecloud.com/api"
+                : "https://api.akile.ai/api";
+            const options = {
+                method,
+                headers: {
+                    "Content-Type": "application/json;charset=UTF-8",
+                    Authorization: token,
+                },
+            };
+            if (payload !== null) {
+                options.body = JSON.stringify(payload);
+            }
+            const response = await fetch(apiBase + path, options);
+            const text = await response.text();
+            let parsed;
+            try {
+                parsed = JSON.parse(text);
+            } catch (_) {
+                parsed = {status_msg: "API 返回了非 JSON 响应"};
+            }
+            done({http_status: response.status, body: parsed});
+        })().catch(error => done({http_status: 0, error: String(error)}));
+        """
+        return self.browser.execute_async_script(script, path, method, body)
 
-        text = self._page_text()
-        if any(message in text for message in ("签到成功", "签到成功！", "领取成功")):
-            return "success"
-        if any(message in text for message in ("今日已签到", "已经签到", "重复签到")):
-            return "already"
+    @staticmethod
+    def _api_is_success(response):
+        if not isinstance(response, dict) or response.get("http_status") != 200:
+            return False
+        body = response.get("body")
+        return isinstance(body, dict) and body.get("status_code") in (
+            0,
+            200,
+            "0",
+            "200",
+        )
+
+    @staticmethod
+    def _api_message(response):
+        if not isinstance(response, dict):
+            return "没有收到 API 响应"
+        if response.get("error"):
+            return str(response["error"])
+        body = response.get("body")
+        if isinstance(body, dict) and body.get("status_msg"):
+            return str(body["status_msg"])
+        status = response.get("http_status")
+        return f"HTTP {status}" if status else "网络请求失败"
+
+    def _get_akcoin_log(self):
+        """读取最近 AK 币流水，返回 (记录, 错误信息)。"""
+        response = self._api_request(
+            "/v1/akcoin/log", "POST", {"page_num": 1, "page_size": 100}
+        )
+        if not self._api_is_success(response):
+            return None, f"读取 AK 币流水失败：{self._api_message(response)}"
+
+        body = response.get("body", {})
+        records = body.get("list", [])
+        if not isinstance(records, list):
+            return None, "读取 AK 币流水失败：返回格式不正确"
+        return records, None
+
+    @staticmethod
+    def _find_today_checkin(records):
+        china_timezone = timezone(timedelta(hours=8))
+        today = datetime.now(china_timezone).strftime("%Y-%m-%d")
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            remark = str(record.get("remark") or "")
+            record_time = str(
+                record.get("updated_at") or record.get("created_at") or ""
+            )
+            if "签到" in remark and (
+                remark.startswith(today) or record_time.startswith(today)
+            ):
+                return record
         return None
 
-    def _wait_for_checkin_result(self, previous_points_num, timeout=15):
+    def _wait_for_today_checkin(self, timeout=20):
         deadline = time.time() + timeout
+        last_error = None
         while time.time() < deadline:
-            state = self._find_visible_checkin_state()
-            if state:
-                return state, self._get_ak_coins()
+            records, error = self._get_akcoin_log()
+            if error:
+                last_error = error
+            else:
+                record = self._find_today_checkin(records)
+                if record:
+                    return record, None
+            time.sleep(1)
+        return None, last_error or "签到流水尚未出现"
 
-            current_points_num = self._get_ak_coins()
-            if (
-                previous_points_num >= 0
-                and current_points_num >= 0
-                and current_points_num != previous_points_num
-            ):
-                return "success", current_points_num
-
-            time.sleep(0.5)
-
-        return None, self._get_ak_coins()
+    @staticmethod
+    def _record_number(record, field):
+        try:
+            return int(record.get(field))
+        except (AttributeError, TypeError, ValueError):
+            return -1
 
     def _is_logged_out(self):
         url = (self.browser.current_url or "").lower()
@@ -371,59 +495,55 @@ class AkileCheckin:
         prev_points_num = self._get_ak_coins()
         print(f"当前AK币: {prev_points_num}")
 
-        if self._find_visible_checkin_state() == "already":
-            msg = f"今日已签到，未重复执行签到，现在有{prev_points_num}AK币"
+        # 页面按钮只由 last_checkin_time 控制，不能作为真实签到结果。
+        records, error = self._get_akcoin_log()
+        if error:
+            self._fail(error + "\n签到失败", screenshot="akcoin_log_before.png")
+
+        today_record = self._find_today_checkin(records)
+        if today_record:
+            current = self._record_number(today_record, "after")
+            if current < 0:
+                current = prev_points_num
+            msg = f"今日已签到，未重复执行签到，现在有{current}AK币"
             print(msg)
             Notice.serverJ(self.push_key, "Akile签到", msg)
-            sys.exit(0)
+            return
 
-        # 尝试签到
-        try:
-            checkin_button = WebDriverWait(self.browser, 15).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, '//button[contains(., "每日签到")]')
-                )
-            )
-            print("找到签到按钮，正在点击...")
-            self.browser.execute_script("arguments[0].click();", checkin_button)
-
-            result, cur_points_num = self._wait_for_checkin_result(prev_points_num)
-            if result == "already":
-                msg = f"今日已签到，未重复执行签到，现在有{cur_points_num}AK币"
-            elif result == "success":
-                if (
-                    prev_points_num < 0
-                    or cur_points_num < 0
-                    or cur_points_num <= prev_points_num
-                ):
-                    msg = f"签到成功，积分正在刷新，当前有{cur_points_num}个AK币"
-                else:
-                    gain = cur_points_num - prev_points_num
-                    msg = f"签到成功, 获得{gain}个AK币, 当前有{cur_points_num}个AK币"
-            else:
-                self._fail(
-                    "点击签到后未检测到成功结果。"
-                    "页面可能改版、请求被拦截或网络异常，请查看失败截图后重试。\n签到失败",
-                    screenshot="checkin_result_timeout.png",
-                )
-
-            print(msg)
-            Notice.serverJ(self.push_key, "Akile签到", msg)
-            sys.exit(0)
-
-        except TimeoutException:
-            print("未找到签到按钮，再次检查是否已签到...")
-            if self._find_visible_checkin_state() == "already":
-                msg = f"今日已签到，未重复执行签到，现在有{prev_points_num}AK币"
-                print(msg)
-                Notice.serverJ(self.push_key, "Akile签到", msg)
-                sys.exit(0)
+        print("今天暂无签到流水，正在调用 Akile 官方签到接口...")
+        response = self._api_request("/v1/user/Checkin")
+        if not self._api_is_success(response):
             self._fail(
-                "签到按钮和已签到按钮都无法加载出来。"
-                "可能是网络波动、页面改版，或登录后被安全弹窗拦截。"
-                "请稍后重试；若出现强制改密提示，请先手动改密。\n签到失败",
-                screenshot="debug.png",
+                f"签到接口调用失败：{self._api_message(response)}\n签到失败",
+                screenshot="checkin_api_failed.png",
             )
+
+        # API 返回成功也不能直接结束，必须以当天流水作为最终凭证。
+        today_record, error = self._wait_for_today_checkin()
+        if not today_record:
+            self._fail(
+                "签到接口返回成功，但未在当天 AK 币流水中查到签到记录。"
+                f" {error or ''}\n签到失败",
+                screenshot="checkin_log_after_timeout.png",
+            )
+
+        amount = self._record_number(today_record, "amount")
+        current = self._record_number(today_record, "after")
+        if amount <= 0 or current < 0:
+            self._fail(
+                "当天签到流水字段异常，未能确认 AK 币已增加。\n签到失败",
+                screenshot="checkin_log_invalid.png",
+            )
+        if prev_points_num >= 0 and current <= prev_points_num:
+            self._fail(
+                f"当天签到流水已出现，但余额未增加（签到前 {prev_points_num}，"
+                f"签到后 {current}）。\n签到失败",
+                screenshot="checkin_balance_unchanged.png",
+            )
+
+        msg = f"签到成功, 获得{amount}个AK币, 当前有{current}个AK币"
+        print(msg)
+        Notice.serverJ(self.push_key, "Akile签到", msg)
 
     def __del__(self):
         if self.browser:
