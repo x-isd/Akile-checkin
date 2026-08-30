@@ -10,6 +10,9 @@ jobs:
   checkin:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: akile-daily-checkin
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -28,9 +31,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Validate credentials are present
+        env:
+          AKILE_EMAIL: ${{ secrets.AKILE_EMAIL }}
+          AKILE_PASSWORD: ${{ secrets.AKILE_PASSWORD }}
+        run: |
+          test -n "$AKILE_EMAIL" || { echo "::error::Missing Actions secret AKILE_EMAIL"; exit 1; }
+          test -n "$AKILE_PASSWORD" || { echo "::error::Missing Actions secret AKILE_PASSWORD"; exit 1; }
+
       - name: Run check-in
         env:
           AKILE_EMAIL: ${{ secrets.AKILE_EMAIL }}
           AKILE_PASSWORD: ${{ secrets.AKILE_PASSWORD }}
           AKILE_PUSH_KEY: ${{ secrets.AKILE_PUSH_KEY }}
         run: python Akile-Checkin.py
+
+      - name: Upload diagnostic screenshot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: akile-checkin-diagnostics
+          path: '*.png'
+          if-no-files-found: ignore
