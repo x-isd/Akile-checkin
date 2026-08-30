@@ -209,3 +209,6 @@ __marimo__/
 # other
 config.ini
 .backup_before_fix_*/
+.backup_before_runtime_compat_*/
+.backup_before_edge_fallback_*/
+.backup_before_api_checkin_fix_*/
