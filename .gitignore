@@ -208,3 +208,4 @@ __marimo__/
 
 # other
 config.ini
+.backup_before_fix_*/
