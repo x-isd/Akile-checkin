@@ -300,9 +300,47 @@ class AkileCheckin:
         try:
             element = self.browser.find_element(By.CSS_SELECTOR, ".coin-balance-value")
             text = element.text.strip()
-            return int(re.search(r"(\d+)", text).group(1))
+            match = re.search(r"(\d+)", text)
+            return int(match.group(1)) if match else -1
         except Exception:
             return -1
+
+    def _find_visible_checkin_state(self):
+        for label, state in (("已签到", "already"), ("今日已签到", "already")):
+            try:
+                buttons = self.browser.find_elements(
+                    By.XPATH, f'//button[contains(normalize-space(.), "{label}")]'
+                )
+                if any(button.is_displayed() for button in buttons):
+                    return state
+            except Exception:
+                continue
+
+        text = self._page_text()
+        if any(message in text for message in ("签到成功", "签到成功！", "领取成功")):
+            return "success"
+        if any(message in text for message in ("今日已签到", "已经签到", "重复签到")):
+            return "already"
+        return None
+
+    def _wait_for_checkin_result(self, previous_points_num, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            state = self._find_visible_checkin_state()
+            if state:
+                return state, self._get_ak_coins()
+
+            current_points_num = self._get_ak_coins()
+            if (
+                previous_points_num >= 0
+                and current_points_num >= 0
+                and current_points_num != previous_points_num
+            ):
+                return "success", current_points_num
+
+            time.sleep(0.5)
+
+        return None, self._get_ak_coins()
 
     def _is_logged_out(self):
         url = (self.browser.current_url or "").lower()
@@ -333,18 +371,11 @@ class AkileCheckin:
         prev_points_num = self._get_ak_coins()
         print(f"当前AK币: {prev_points_num}")
 
-        # 已签到（页面文案可能是「今日已签到」或「已签到」）
-        try:
-            done_button = self.browser.find_element(
-                By.XPATH, '//button[contains(., "已签到")]'
-            )
-            if done_button.is_displayed():
-                msg = f"今日已签到, 现在有{prev_points_num}AK币"
-                print(msg)
-                Notice.serverJ(self.push_key, "Akile签到", msg)
-                sys.exit(0)
-        except Exception:
-            pass
+        if self._find_visible_checkin_state() == "already":
+            msg = f"今日已签到，未重复执行签到，现在有{prev_points_num}AK币"
+            print(msg)
+            Notice.serverJ(self.push_key, "Akile签到", msg)
+            sys.exit(0)
 
         # 尝试签到
         try:
@@ -355,14 +386,26 @@ class AkileCheckin:
             )
             print("找到签到按钮，正在点击...")
             self.browser.execute_script("arguments[0].click();", checkin_button)
-            time.sleep(3)
 
-            cur_points_num = self._get_ak_coins()
-            if prev_points_num == -1:
-                msg = f"签到成功, 当前有{cur_points_num}个AK币"
+            result, cur_points_num = self._wait_for_checkin_result(prev_points_num)
+            if result == "already":
+                msg = f"今日已签到，未重复执行签到，现在有{cur_points_num}AK币"
+            elif result == "success":
+                if (
+                    prev_points_num < 0
+                    or cur_points_num < 0
+                    or cur_points_num <= prev_points_num
+                ):
+                    msg = f"签到成功，积分正在刷新，当前有{cur_points_num}个AK币"
+                else:
+                    gain = cur_points_num - prev_points_num
+                    msg = f"签到成功, 获得{gain}个AK币, 当前有{cur_points_num}个AK币"
             else:
-                gain = cur_points_num - prev_points_num if cur_points_num > 0 else 0
-                msg = f"签到成功, 获得{gain}个AK币, 当前有{cur_points_num}个AK币"
+                self._fail(
+                    "点击签到后未检测到成功结果。"
+                    "页面可能改版、请求被拦截或网络异常，请查看失败截图后重试。\n签到失败",
+                    screenshot="checkin_result_timeout.png",
+                )
 
             print(msg)
             Notice.serverJ(self.push_key, "Akile签到", msg)
@@ -370,22 +413,17 @@ class AkileCheckin:
 
         except TimeoutException:
             print("未找到签到按钮，再次检查是否已签到...")
-            try:
-                self.browser.find_element(
-                    By.XPATH, '//button[contains(., "已签到")]'
-                )
-                msg = f"今日已签到, 现在有{prev_points_num}AK币"
+            if self._find_visible_checkin_state() == "already":
+                msg = f"今日已签到，未重复执行签到，现在有{prev_points_num}AK币"
                 print(msg)
                 Notice.serverJ(self.push_key, "Akile签到", msg)
                 sys.exit(0)
-            except Exception as e:
-                print(f"查找已签到按钮失败: {e}")
-                self._fail(
-                    "签到按钮和已签到按钮都无法加载出来。"
-                    "可能是网络波动、页面改版，或登录后被安全弹窗拦截。"
-                    "请稍后重试；若出现强制改密提示，请先手动改密。\n签到失败",
-                    screenshot="debug.png",
-                )
+            self._fail(
+                "签到按钮和已签到按钮都无法加载出来。"
+                "可能是网络波动、页面改版，或登录后被安全弹窗拦截。"
+                "请稍后重试；若出现强制改密提示，请先手动改密。\n签到失败",
+                screenshot="debug.png",
+            )
 
     def __del__(self):
         if self.browser:
